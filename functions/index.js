@@ -375,23 +375,25 @@ exports.exportAttendanceCSV = functions.https.onCall(async (data, ctx) => {
   return { url }
 })
 
-// ─── 10. promoteRollNumbers — scheduled every July 1 ─────────────────────────
+// ─── 10. promoteRollNumbers – scheduled every July 1 ────────────────────────
 //  FE → SE → TE → BE  (BE stays BE; students must be manually graduated)
-exports.promoteRollNumbers = functions.pubsub
-  .schedule('0 0 1 7 *')       // 00:00 IST on July 1
-  .timeZone('Asia/Kolkata')
-  .onRun(async () => {
-    const MAP   = { FE: 'SE', SE: 'TE', TE: 'BE' }
-    const snap  = await db.collection('users')
-      .where('role', '==', 'student').where('year', 'in', ['FE', 'SE', 'TE']).get()
-    const batch = db.batch()
-    snap.docs.forEach(doc => {
-      const { year, branch, roll } = doc.data()
-      const newYear      = MAP[year]
-      const newRollNumber = `${newYear}-${branch}${pad(roll, 3)}`
-      batch.update(doc.ref, { year: newYear, rollNumber: newRollNumber })
-    })
-    await batch.commit()
-    console.log(`Promoted ${snap.size} students to next year.`)
-    return null
+const { onSchedule } = require('firebase-functions/v2/scheduler')
+
+exports.promoteRollNumbers = onSchedule({
+  schedule: '0 0 1 7 *',
+  timeZone: 'Asia/Kolkata',
+}, async () => {
+  const MAP   = { FE: 'SE', SE: 'TE', TE: 'BE' }
+  const snap  = await db.collection('users')
+    .where('role', '==', 'student').where('year', 'in', ['FE', 'SE', 'TE']).get()
+  const batch = db.batch()
+  snap.docs.forEach(doc => {
+    const { year, branch, roll } = doc.data()
+    const newYear       = MAP[year]
+    const newRollNumber = `${newYear}-${branch}${pad(roll, 3)}`
+    batch.update(doc.ref, { year: newYear, rollNumber: newRollNumber })
   })
+  await batch.commit()
+  console.log(`Promoted ${snap.size} students to next year.`)
+  return null
+})
