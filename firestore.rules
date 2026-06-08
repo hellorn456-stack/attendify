@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuth()           { return request.auth != null; }
+    function isOwner(uid)       { return request.auth.uid == uid; }
+    function role()             { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role; }
+    function isAdmin()          { return isAuth() && role() == 'admin'; }
+    function isTeacher()        { return isAuth() && role() == 'teacher'; }
+    function isTeacherOrAdmin() { return isAuth() && role() in ['teacher','admin']; }
+
+    match /users/{uid} {
+      allow read:   if isOwner(uid) || isTeacherOrAdmin();
+      allow create: if false;
+      allow update: if (isOwner(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['phone','email'])) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /counters/{id}           { allow read, write: if false; }
+    match /webauthn_challenges/{id}{ allow read, write: if false; }
+
+    match /lectures/{lectureId} {
+      allow read:   if isAuth();
+      allow create: if isTeacher() && request.resource.data.teacherUid == request.auth.uid;
+      allow update: if (isTeacher() && resource.data.teacherUid == request.auth.uid) || isAdmin();
+      allow delete: if isAdmin();
+
+      match /attendance/{studentUid} {
+        allow read:  if isOwner(studentUid) || isTeacher() || isAdmin();
+        allow write: if false;
+      }
+    }
+
+    match /passkeys/{uid}/devices/{credentialId} {
+      allow read:  if isOwner(uid) || isAdmin();
+      allow write: if false;
+    }
+
+    match /attendanceSummary/{uid} {
+      allow read:  if isOwner(uid) || isTeacherOrAdmin();
+      allow write: if false;
+    }
+
+    match /appConfig/{doc} {
+      allow read:  if isAuth();
+      allow write: if isAdmin();
+    }
+  }
+}
