@@ -32,8 +32,11 @@ const db      = admin.firestore()
 const storage = admin.storage()
 
 // ─── Update these two lines before deploying to production ───────────────────
-const APP_ORIGIN      = 'http://localhost:5173'        // e.g. https://attendify.vercel.app
-const APP_RP_ID       = 'localhost'                    // e.g. attendify.vercel.app
+// const APP_ORIGIN      = 'http://localhost:5173'        // e.g. https://attendify.vercel.app
+// const APP_RP_ID       = 'localhost'                    // e.g. attendify.vercel.app
+const APP_ORIGIN = process.env.APP_ORIGIN || 'http://localhost:5173'
+const APP_RP_ID  = process.env.APP_RP_ID  || 'localhost'
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const QR_TTL_MS        = 30_000   // QR token validity (30 s default)
