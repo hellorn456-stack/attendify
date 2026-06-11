@@ -1,50 +1,31 @@
-/**
- * Attendify — Firebase Cloud Functions
- *
- * ┌─────────────────────────────────────────────────────────────┐
- * │  FUNCTION LIST                                              │
- * │  1.  createStudentProfile    – atomic STU-XXXXX + roll no. │
- * │  2.  createTeacherProfile    – atomic TCH-XXXXX (admin)    │
- * │  3.  createLecture           – start session + first QR    │
- * │  4.  rotateLectureQR         – rotate QR token             │
- * │  5.  endLecture              – close active session        │
- * │  6.  generateWebAuthnChallenge – server-side challenge     │
- * │  7.  verifyWebAuthnRegistration – store new passkey        │
- * │  8.  verifyAttendance        – GPS + QR + passkey check    │
- * │  9.  exportAttendanceCSV     – signed CSV download URL     │
- * │  10. promoteRollNumbers      – scheduled July 1 each year  │
- * └─────────────────────────────────────────────────────────────┘
- */
-
 'use strict'
+
+/**
+ * Attendify — Cloud Functions
+ * Key change from previous version: @simplewebauthn/server is now required
+ * lazily (inside each function that needs it) instead of at the top level.
+ * This means a WebAuthn load error cannot crash createStudentProfile,
+ * createLecture, verifyAttendance, etc.
+ */
 
 const functions = require('firebase-functions')
 const admin     = require('firebase-admin')
-const {
-  generateRegistrationOptions,
-  generateAuthenticationOptions,
-  verifyRegistrationResponse,
-  verifyAuthenticationResponse,
-} = require('@simplewebauthn/server')
+const { onSchedule } = require('firebase-functions/v2/scheduler')
 
 admin.initializeApp()
 const db      = admin.firestore()
 const storage = admin.storage()
 
-// ─── Update these two lines before deploying to production ───────────────────
-// const APP_ORIGIN      = 'http://localhost:5173'        // e.g. https://attendify.vercel.app
-// const APP_RP_ID       = 'localhost'                    // e.g. attendify.vercel.app
-const APP_ORIGIN = process.env.APP_ORIGIN || 'http://localhost:5173'
-const APP_RP_ID  = process.env.APP_RP_ID  || 'localhost'
-
+// ─── Update before deploying to production ────────────────────────────────────
+const APP_ORIGIN      = 'http://localhost:5173'   // e.g. https://attendify.vercel.app
+const APP_RP_ID       = 'localhost'               // e.g. attendify.vercel.app
 // ─────────────────────────────────────────────────────────────────────────────
 
-const QR_TTL_MS        = 30_000   // QR token validity (30 s default)
-const CHALLENGE_TTL_MS = 60_000   // WebAuthn challenge validity (60 s)
+const QR_TTL_MS        = 30_000
+const CHALLENGE_TTL_MS = 60_000
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Atomically increment a named Firestore counter; return the new value. */
 async function nextCounter(name) {
   const ref = db.doc(`counters/${name}`)
   return db.runTransaction(async (tx) => {
@@ -55,21 +36,19 @@ async function nextCounter(name) {
   })
 }
 
-/** Zero-pad n to width digits. */
 const pad = (n, w = 5) => String(n).padStart(w, '0')
 
-/** Haversine distance in metres. */
 function metres(lat1, lng1, lat2, lng2) {
   const R  = 6_371_000
-  const φ1 = (lat1 * Math.PI) / 180, φ2 = (lat2 * Math.PI) / 180
-  const Δφ = ((lat2 - lat1) * Math.PI) / 180
-  const Δλ = ((lng2 - lng1) * Math.PI) / 180
-  const a  = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2
+  const p1 = (lat1 * Math.PI) / 180, p2 = (lat2 * Math.PI) / 180
+  const dp = ((lat2 - lat1) * Math.PI) / 180
+  const dl = ((lng2 - lng1) * Math.PI) / 180
+  const a  = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
-/** Cryptographically random hex string. */
-const token = (bytes = 32) => require('crypto').randomBytes(bytes).toString('hex')
+const randomToken = (bytes = 32) =>
+  require('crypto').randomBytes(bytes).toString('hex')
 
 // ─── 1. createStudentProfile ─────────────────────────────────────────────────
 exports.createStudentProfile = functions.https.onCall(async (data, ctx) => {
@@ -80,15 +59,15 @@ exports.createStudentProfile = functions.https.onCall(async (data, ctx) => {
   const rollNo = Number(roll)
 
   if (!Number.isInteger(rollNo) || rollNo < 1 || rollNo > 300) {
-    throw new functions.https.HttpsError('invalid-argument', 'Roll number must be 1–300.')
+    throw new functions.https.HttpsError('invalid-argument', `Roll number must be between 1 and 300. Got: ${roll}`)
   }
 
-  // Check roll number uniqueness within year + branch
+  // Uniqueness check
   const dup = await db.collection('users')
     .where('year', '==', year).where('branch', '==', branch).where('roll', '==', rollNo)
     .limit(1).get()
   if (!dup.empty) {
-    throw new functions.https.HttpsError('already-exists', `Roll ${rollNo} already taken in ${year}-${branch}.`)
+    throw new functions.https.HttpsError('already-exists', `Roll ${rollNo} is already taken in ${year}-${branch}.`)
   }
 
   const counter    = await nextCounter('studentCounter')
@@ -119,10 +98,8 @@ exports.createTeacherProfile = functions.https.onCall(async (data, ctx) => {
   const systemId = `TCH-${pad(counter)}`
 
   await db.doc(`users/${uid}`).set({
-    role: 'teacher',
-    firstName, middleName: middleName || '', surname,
-    email, phone: '',
-    systemId, subjects: subjects || [],
+    role: 'teacher', firstName, middleName: middleName || '', surname,
+    email, phone: '', systemId, subjects: subjects || [],
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   })
 
@@ -138,19 +115,18 @@ exports.createLecture = functions.https.onCall(async (data, ctx) => {
   }
 
   const { subject, lectureName, date, startTime, endTime, locationLat, locationLng, radius } = data
-  const qrToken     = token()
+  const qrToken     = randomToken()
   const qrExpiresAt = Date.now() + QR_TTL_MS
 
   const ref = await db.collection('lectures').add({
-    teacherUid:  ctx.auth.uid,
+    teacherUid: ctx.auth.uid,
     teacherName: `${teacher.data().firstName} ${teacher.data().surname}`,
     subject, lectureName, date, startTime, endTime,
     locationLat, locationLng,
-    radius:         Number(radius) || 50,
-    active:         true,
-    qrToken,        qrExpiresAt,
+    radius: Number(radius) || 50,
+    active: true, qrToken, qrExpiresAt,
     attendanceCount: 0,
-    createdAt:      admin.firestore.FieldValue.serverTimestamp(),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
   })
 
   return { lectureId: ref.id, qrToken, qrExpiresAt }
@@ -160,14 +136,12 @@ exports.createLecture = functions.https.onCall(async (data, ctx) => {
 exports.rotateLectureQR = functions.https.onCall(async (data, ctx) => {
   if (!ctx.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.')
   const { lectureId } = data
-  const ref     = db.doc(`lectures/${lectureId}`)
-  const lecture  = await ref.get()
-  if (!lecture.exists) throw new functions.https.HttpsError('not-found', 'Lecture not found.')
-  if (lecture.data().teacherUid !== ctx.auth.uid) {
-    throw new functions.https.HttpsError('permission-denied', 'Not your lecture.')
-  }
+  const ref    = db.doc(`lectures/${lectureId}`)
+  const snap   = await ref.get()
+  if (!snap.exists) throw new functions.https.HttpsError('not-found', 'Lecture not found.')
+  if (snap.data().teacherUid !== ctx.auth.uid) throw new functions.https.HttpsError('permission-denied', 'Not your lecture.')
 
-  const qrToken     = token()
+  const qrToken     = randomToken()
   const qrExpiresAt = Date.now() + QR_TTL_MS
   await ref.update({ qrToken, qrExpiresAt })
   return { qrToken, qrExpiresAt }
@@ -177,21 +151,26 @@ exports.rotateLectureQR = functions.https.onCall(async (data, ctx) => {
 exports.endLecture = functions.https.onCall(async (data, ctx) => {
   if (!ctx.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.')
   const { lectureId } = data
-  const ref    = db.doc(`lectures/${lectureId}`)
-  const lecture = await ref.get()
-  if (!lecture.exists) throw new functions.https.HttpsError('not-found', 'Lecture not found.')
-  if (lecture.data().teacherUid !== ctx.auth.uid) {
-    throw new functions.https.HttpsError('permission-denied', 'Not your lecture.')
-  }
+  const ref   = db.doc(`lectures/${lectureId}`)
+  const snap  = await ref.get()
+  if (!snap.exists) throw new functions.https.HttpsError('not-found', 'Lecture not found.')
+  if (snap.data().teacherUid !== ctx.auth.uid) throw new functions.https.HttpsError('permission-denied', 'Not your lecture.')
   await ref.update({ active: false, qrToken: null, endedAt: admin.firestore.FieldValue.serverTimestamp() })
   return { success: true }
 })
 
 // ─── 6. generateWebAuthnChallenge ────────────────────────────────────────────
+// @simplewebauthn/server is required lazily here so a load error in this
+// package cannot break the student/teacher profile or attendance functions.
 exports.generateWebAuthnChallenge = functions.https.onCall(async (data, ctx) => {
   if (!ctx.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.')
+  const {
+    generateRegistrationOptions,
+    generateAuthenticationOptions,
+  } = require('@simplewebauthn/server')
+
   const uid      = ctx.auth.uid
-  const { type } = data // 'registration' | 'authentication'
+  const { type } = data
 
   let options
   if (type === 'registration') {
@@ -204,7 +183,7 @@ exports.generateWebAuthnChallenge = functions.https.onCall(async (data, ctx) => 
     })
   } else {
     const devSnap = await db.collection(`passkeys/${uid}/devices`).get()
-    const allowCredentials = devSnap.docs.map(d => ({
+    const allowCredentials = devSnap.docs.map((d) => ({
       id: Buffer.from(d.data().credentialId, 'base64url'), type: 'public-key',
     }))
     options = await generateAuthenticationOptions({
@@ -216,13 +195,14 @@ exports.generateWebAuthnChallenge = functions.https.onCall(async (data, ctx) => 
     uid, type, challenge: options.challenge,
     expiresAt: Date.now() + CHALLENGE_TTL_MS, used: false,
   })
-
   return options
 })
 
 // ─── 7. verifyWebAuthnRegistration ───────────────────────────────────────────
 exports.verifyWebAuthnRegistration = functions.https.onCall(async (data, ctx) => {
   if (!ctx.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.')
+  const { verifyRegistrationResponse } = require('@simplewebauthn/server')
+
   const uid = ctx.auth.uid
   const { response: attResp, deviceName } = data
 
@@ -249,60 +229,56 @@ exports.verifyWebAuthnRegistration = functions.https.onCall(async (data, ctx) =>
     credentialId,
     publicKey:  Buffer.from(credentialPublicKey).toString('base64url'),
     counter, deviceName: deviceName || 'Unknown device',
-    createdAt:  admin.firestore.FieldValue.serverTimestamp(),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
   })
-
   return { success: true }
 })
 
-// ─── 8. verifyAttendance — THE CRITICAL FUNCTION ─────────────────────────────
-//  Validates all three layers server-side and records attendance atomically.
-//  No client-side result is ever trusted.
+// ─── 8. verifyAttendance — the core triple-layer check ───────────────────────
 exports.verifyAttendance = functions.https.onCall(async (data, ctx) => {
   if (!ctx.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.')
+  const { verifyAuthenticationResponse } = require('@simplewebauthn/server')
+
   const uid = ctx.auth.uid
   const { lectureId, locationLat, locationLng, qrToken, webauthnResponse } = data
 
-  // ── Layer 0: Load & validate lecture ──────────────────────────────────────
+  // Load lecture
   const lectureSnap = await db.doc(`lectures/${lectureId}`).get()
   if (!lectureSnap.exists) throw new functions.https.HttpsError('not-found', 'Lecture not found.')
   const lecture = lectureSnap.data()
   if (!lecture.active) throw new functions.https.HttpsError('failed-precondition', 'This session has ended.')
 
-  // ── Duplicate guard ────────────────────────────────────────────────────────
+  // Duplicate guard
   const existing = await db.doc(`lectures/${lectureId}/attendance/${uid}`).get()
   if (existing.exists) throw new functions.https.HttpsError('already-exists', 'Attendance already marked.')
 
-  // ── Layer 1: GPS location ─────────────────────────────────────────────────
+  // Layer 1: GPS
   const dist = metres(locationLat, locationLng, lecture.locationLat, lecture.locationLng)
   if (dist > lecture.radius) {
-    throw new functions.https.HttpsError(
-      'out-of-range',
-      `You are ${Math.round(dist)}m away (limit: ${lecture.radius}m). Move closer and try again.`
-    )
+    throw new functions.https.HttpsError('out-of-range', `You are ${Math.round(dist)}m away (limit: ${lecture.radius}m).`)
   }
 
-  // ── Layer 2: QR token ─────────────────────────────────────────────────────
+  // Layer 2: QR token
   if (qrToken !== lecture.qrToken) {
-    throw new functions.https.HttpsError('invalid-argument', 'Invalid QR code. Please scan the latest code.')
+    throw new functions.https.HttpsError('invalid-argument', 'Invalid QR code. Scan the latest code.')
   }
   if (Date.now() > lecture.qrExpiresAt) {
     throw new functions.https.HttpsError('deadline-exceeded', 'QR code expired. Scan the latest code.')
   }
 
-  // ── Layer 3: WebAuthn passkey ─────────────────────────────────────────────
+  // Layer 3: WebAuthn
   const challengeSnap = await db.collection('webauthn_challenges')
     .where('uid', '==', uid).where('type', '==', 'authentication').where('used', '==', false)
     .orderBy('expiresAt', 'desc').limit(1).get()
   if (challengeSnap.empty) throw new functions.https.HttpsError('not-found', 'No passkey challenge found.')
 
-  const challengeDoc = challengeSnap.docs[0]
+  const challengeDoc           = challengeSnap.docs[0]
   const { challenge, expiresAt } = challengeDoc.data()
-  if (Date.now() > expiresAt) throw new functions.https.HttpsError('deadline-exceeded', 'Passkey challenge expired.')
+  if (Date.now() > expiresAt) throw new functions.https.HttpsError('deadline-exceeded', 'Challenge expired.')
 
   const credentialId = webauthnResponse.id
   const passkeyDoc   = await db.doc(`passkeys/${uid}/devices/${credentialId}`).get()
-  if (!passkeyDoc.exists) throw new functions.https.HttpsError('not-found', 'Passkey not registered on this account.')
+  if (!passkeyDoc.exists) throw new functions.https.HttpsError('not-found', 'Passkey not registered.')
 
   const pk = passkeyDoc.data()
   const result = await verifyAuthenticationResponse({
@@ -316,15 +292,14 @@ exports.verifyAttendance = functions.https.onCall(async (data, ctx) => {
   })
   if (!result.verified) throw new functions.https.HttpsError('unauthenticated', 'Passkey authentication failed.')
 
-  // Update counter (replay-attack prevention)
   await passkeyDoc.ref.update({ counter: result.authenticationInfo.newCounter })
   await challengeDoc.ref.update({ used: true })
 
-  // ── Record attendance atomically ───────────────────────────────────────────
+  // Record atomically
   const studentSnap = await db.doc(`users/${uid}`).get()
   const student     = studentSnap.data()
+  const batch       = db.batch()
 
-  const batch = db.batch()
   batch.set(db.doc(`lectures/${lectureId}/attendance/${uid}`), {
     studentUid: uid, systemId: student.systemId, rollNumber: student.rollNumber,
     locationLat, locationLng, distanceMetres: Math.round(dist),
@@ -340,15 +315,7 @@ exports.verifyAttendance = functions.https.onCall(async (data, ctx) => {
   }, { merge: true })
 
   await batch.commit()
-
-  return {
-    success: true,
-    systemId:    student.systemId,
-    rollNumber:  student.rollNumber,
-    subject:     lecture.subject,
-    lectureName: lecture.lectureName,
-    timestamp:   new Date().toISOString(),
-  }
+  return { success: true, systemId: student.systemId, rollNumber: student.rollNumber, subject: lecture.subject, lectureName: lecture.lectureName, timestamp: new Date().toISOString() }
 })
 
 // ─── 9. exportAttendanceCSV ───────────────────────────────────────────────────
@@ -357,46 +324,38 @@ exports.exportAttendanceCSV = functions.https.onCall(async (data, ctx) => {
   const { lectureId } = data
   const lecture = await db.doc(`lectures/${lectureId}`).get()
   if (!lecture.exists) throw new functions.https.HttpsError('not-found', 'Lecture not found.')
-  if (lecture.data().teacherUid !== ctx.auth.uid) {
-    throw new functions.https.HttpsError('permission-denied', 'Not your lecture.')
-  }
+  if (lecture.data().teacherUid !== ctx.auth.uid) throw new functions.https.HttpsError('permission-denied', 'Not your lecture.')
 
-  const rows  = await db.collection(`lectures/${lectureId}/attendance`).get()
-  const lines = [
+  const rows = await db.collection(`lectures/${lectureId}/attendance`).get()
+  const csv  = [
     ['System ID', 'Roll Number', 'Timestamp', 'Distance (m)', 'Verified'],
-    ...rows.docs.map(d => {
+    ...rows.docs.map((d) => {
       const r = d.data()
       return [r.systemId, r.rollNumber, r.timestamp?.toDate().toISOString() ?? '', r.distanceMetres ?? '', r.verified ? 'Yes' : 'No']
     }),
-  ]
-  const csv      = lines.map(r => r.join(',')).join('\n')
+  ].map((r) => r.join(',')).join('\n')
+
   const filePath = `exports/${ctx.auth.uid}/${lectureId}.csv`
   const file     = storage.bucket().file(filePath)
-
   await file.save(csv, { contentType: 'text/csv' })
   const [url] = await file.getSignedUrl({ action: 'read', expires: Date.now() + 15 * 60 * 1000 })
   return { url }
 })
 
-// ─── 10. promoteRollNumbers – scheduled every July 1 ────────────────────────
-//  FE → SE → TE → BE  (BE stays BE; students must be manually graduated)
-const { onSchedule } = require('firebase-functions/v2/scheduler')
-
-exports.promoteRollNumbers = onSchedule({
-  schedule: '0 0 1 7 *',
-  timeZone: 'Asia/Kolkata',
-}, async () => {
-  const MAP   = { FE: 'SE', SE: 'TE', TE: 'BE' }
-  const snap  = await db.collection('users')
-    .where('role', '==', 'student').where('year', 'in', ['FE', 'SE', 'TE']).get()
-  const batch = db.batch()
-  snap.docs.forEach(doc => {
-    const { year, branch, roll } = doc.data()
-    const newYear       = MAP[year]
-    const newRollNumber = `${newYear}-${branch}${pad(roll, 3)}`
-    batch.update(doc.ref, { year: newYear, rollNumber: newRollNumber })
-  })
-  await batch.commit()
-  console.log(`Promoted ${snap.size} students to next year.`)
-  return null
-})
+// ─── 10. promoteRollNumbers — runs July 1 each year ──────────────────────────
+exports.promoteRollNumbers = onSchedule(
+  { schedule: '0 0 1 7 *', timeZone: 'Asia/Kolkata' },
+  async () => {
+    const MAP  = { FE: 'SE', SE: 'TE', TE: 'BE' }
+    const snap = await db.collection('users')
+      .where('role', '==', 'student').where('year', 'in', ['FE', 'SE', 'TE']).get()
+    const batch = db.batch()
+    snap.docs.forEach((d) => {
+      const { year, branch, roll } = d.data()
+      const newYear = MAP[year]
+      batch.update(d.ref, { year: newYear, rollNumber: `${newYear}-${branch}${pad(roll, 3)}` })
+    })
+    await batch.commit()
+    console.log(`Promoted ${snap.size} students.`)
+  }
+)

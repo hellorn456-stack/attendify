@@ -1,12 +1,42 @@
-node_modules/
-dist/
+.vscode/
+
+# ==================================================
+# CURRENT PROJECT FILES / FOLDERS
+# ==================================================
+
+# Environment variables
 .env
-.env.local
-.env.production
+functions/.env
+
+# Dependencies
+node_modules/
+functions/node_modules/
+
+# Vite build output
+dist/
+
+# Temporary helper file
+folder_tree.txt
+
+
+# ==================================================
+# FUTURE-PROOFING (optional)
+# ==================================================
+
+# Firebase cache
 .firebase/
+
+# Logs
+*.log
 firebase-debug.log
 firestore-debug.log
-*.log
+
+# Additional env files
+.env.local
+.env.development
+.env.production
+.env.test
+
+# OS files
 .DS_Store
-.vscode/
-functions/.env
+Thumbs.db
