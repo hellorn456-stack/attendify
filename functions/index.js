@@ -51,86 +51,72 @@ const randomToken = (bytes = 32) =>
   require('crypto').randomBytes(bytes).toString('hex')
 
 // ─── 1. createStudentProfile ─────────────────────────────────────────────────
-exports.createStudentProfile = functions.https.onCall(async (data, ctx) => {
-  if (!ctx.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.')
-  if (ctx.auth.uid !== data.uid) throw new functions.https.HttpsError('permission-denied', 'UID mismatch.')
+// exports.createStudentProfile = functions.https.onCall(async (data, ctx) => {
+exports.createStudentProfile = functions.https.onCall(
+  { cors: true },
+  async (request) => {
+    if (!request.auth) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Login required.'
+      )
+    }
 
-  const { uid, email, firstName, middleName, surname, year, branch, roll } = data
-  const rollNo = Number(roll)
+    const data = request.data
 
-  if (!Number.isInteger(rollNo) || rollNo < 1 || rollNo > 300) {
-    throw new functions.https.HttpsError('invalid-argument', `Roll number must be between 1 and 300. Got: ${roll}`)
+    if (request.auth.uid !== data.uid) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'UID mismatch.'
+      )
+    }
+
+    const { uid, email, firstName, middleName, surname, year, branch, roll } = data
+    const rollNo = Number(roll)
+
+    if (!Number.isInteger(rollNo) || rollNo < 1 || rollNo > 300) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        `Roll number must be between 1 and 300. Got: ${roll}`
+      )
+    }
+
+    const dup = await db.collection('users')
+      .where('year', '==', year)
+      .where('branch', '==', branch)
+      .where('roll', '==', rollNo)
+      .limit(1)
+      .get()
+
+    if (!dup.empty) {
+      throw new functions.https.HttpsError(
+        'already-exists',
+        `Roll ${rollNo} is already taken in ${year}-${branch}.`
+      )
+    }
+
+    const counter = await nextCounter('studentCounter')
+    const systemId = `STU-${pad(counter)}`
+    const rollNumber = `${year}-${branch}${pad(rollNo, 3)}`
+
+    await db.doc(`users/${uid}`).set({
+      role: 'student',
+      firstName,
+      middleName: middleName || '',
+      surname,
+      email,
+      phone: '',
+      systemId,
+      rollNumber,
+      year,
+      branch,
+      roll: rollNo,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    })
+
+    return { systemId, rollNumber }
   }
-
-  // Uniqueness check
-  const dup = await db.collection('users')
-    .where('year', '==', year).where('branch', '==', branch).where('roll', '==', rollNo)
-    .limit(1).get()
-  if (!dup.empty) {
-    throw new functions.https.HttpsError('already-exists', `Roll ${rollNo} is already taken in ${year}-${branch}.`)
-  }
-
-  const counter    = await nextCounter('studentCounter')
-  const systemId   = `STU-${pad(counter)}`
-  const rollNumber = `${year}-${branch}${pad(rollNo, 3)}`
-
-  await db.doc(`users/${uid}`).set({
-    role: 'student',
-    firstName, middleName: middleName || '', surname,
-    email, phone: '',
-    systemId, rollNumber, year, branch, roll: rollNo,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  })
-
-  return { systemId, rollNumber }
-})
-
-// ─── 2. createTeacherProfile (admin only) ────────────────────────────────────
-exports.createTeacherProfile = functions.https.onCall(async (data, ctx) => {
-  if (!ctx.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.')
-  const caller = await db.doc(`users/${ctx.auth.uid}`).get()
-  if (!caller.exists || caller.data().role !== 'admin') {
-    throw new functions.https.HttpsError('permission-denied', 'Admins only.')
-  }
-
-  const { uid, email, firstName, middleName, surname, subjects } = data
-  const counter  = await nextCounter('teacherCounter')
-  const systemId = `TCH-${pad(counter)}`
-
-  await db.doc(`users/${uid}`).set({
-    role: 'teacher', firstName, middleName: middleName || '', surname,
-    email, phone: '', systemId, subjects: subjects || [],
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  })
-
-  return { systemId }
-})
-
-// ─── 3. createLecture ────────────────────────────────────────────────────────
-exports.createLecture = functions.https.onCall(async (data, ctx) => {
-  if (!ctx.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.')
-  const teacher = await db.doc(`users/${ctx.auth.uid}`).get()
-  if (!teacher.exists || teacher.data().role !== 'teacher') {
-    throw new functions.https.HttpsError('permission-denied', 'Teachers only.')
-  }
-
-  const { subject, lectureName, date, startTime, endTime, locationLat, locationLng, radius } = data
-  const qrToken     = randomToken()
-  const qrExpiresAt = Date.now() + QR_TTL_MS
-
-  const ref = await db.collection('lectures').add({
-    teacherUid: ctx.auth.uid,
-    teacherName: `${teacher.data().firstName} ${teacher.data().surname}`,
-    subject, lectureName, date, startTime, endTime,
-    locationLat, locationLng,
-    radius: Number(radius) || 50,
-    active: true, qrToken, qrExpiresAt,
-    attendanceCount: 0,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  })
-
-  return { lectureId: ref.id, qrToken, qrExpiresAt }
-})
+)
 
 // ─── 4. rotateLectureQR ──────────────────────────────────────────────────────
 exports.rotateLectureQR = functions.https.onCall(async (data, ctx) => {

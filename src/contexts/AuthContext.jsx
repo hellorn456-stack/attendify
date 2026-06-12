@@ -22,8 +22,8 @@ export const useAuth = () => {
 export function AuthProvider({ children }) {
   const [currentUser, setCurrentUser] = useState(null)
   const [userProfile, setUserProfile] = useState(null)
-  const [loading,     setLoading]     = useState(true)
-  const [authError,   setAuthError]   = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [authError, setAuthError] = useState(null)
 
   const fetchProfile = async (uid) => {
     try {
@@ -89,6 +89,11 @@ export function AuthProvider({ children }) {
   // log in properly. Always validate on the frontend BEFORE calling this.
   const signupStudent = async ({ email, password, firstName, middleName, surname, year, branch, roll }) => {
     const { user } = await createUserWithEmailAndPassword(auth, email, password)
+    await user.getIdToken(true)
+
+    // Ensure Firebase Auth has issued and cached an ID token
+    await user.getIdToken(true)
+
     try {
       await httpsCallable(functions, 'createStudentProfile')({
         uid: user.uid, email, firstName, middleName, surname,
@@ -108,6 +113,10 @@ export function AuthProvider({ children }) {
 
   const signupStudentWithGoogle = async ({ firstName, middleName, surname, year, branch, roll }) => {
     const { user } = await signInWithPopup(auth, new GoogleAuthProvider())
+
+    // Ensure ID token exists before calling the function
+    await user.getIdToken(true)
+
     try {
       await httpsCallable(functions, 'createStudentProfile')({
         uid: user.uid, email: user.email, firstName, middleName, surname,
@@ -116,7 +125,7 @@ export function AuthProvider({ children }) {
       return fetchProfile(user.uid)
     } catch (err) {
       console.error('createStudentProfile (Google) failed, deleting auth user:', err)
-      try { await user.delete() } catch {}
+      try { await user.delete() } catch { }
       throw err
     }
   }
