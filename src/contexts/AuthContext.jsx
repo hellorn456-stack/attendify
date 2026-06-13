@@ -22,8 +22,8 @@ export const useAuth = () => {
 export function AuthProvider({ children }) {
   const [currentUser, setCurrentUser] = useState(null)
   const [userProfile, setUserProfile] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [authError, setAuthError] = useState(null)
+  const [loading,     setLoading]     = useState(true)
+  const [authError,   setAuthError]   = useState(null)
 
   const fetchProfile = async (uid) => {
     try {
@@ -38,7 +38,6 @@ export function AuthProvider({ children }) {
   }
 
   useEffect(() => {
-    // Safety timeout — if Firebase never responds in 8 s, show the app anyway
     const timeout = setTimeout(() => {
       setLoading(false)
       setAuthError('Could not connect to Firebase. Check your .env file and internet connection.')
@@ -84,15 +83,12 @@ export function AuthProvider({ children }) {
   }
 
   // ─── Student signup ───────────────────────────────────────────────────────
-  // IMPORTANT: if the Cloud Function fails after the Firebase Auth account is
-  // created, we delete the auth account to avoid orphaned users who can never
-  // log in properly. Always validate on the frontend BEFORE calling this.
+  // getIdToken(true) forces Firebase to generate an ID token immediately after
+  // account creation. Without this, the callable function may receive an empty
+  // auth header and reject the request. One call is enough.
   const signupStudent = async ({ email, password, firstName, middleName, surname, year, branch, roll }) => {
     const { user } = await createUserWithEmailAndPassword(auth, email, password)
-    await user.getIdToken(true)
-
-    // Ensure Firebase Auth has issued and cached an ID token
-    await user.getIdToken(true)
+    await user.getIdToken(true) // force-generate ID token before calling function
 
     try {
       await httpsCallable(functions, 'createStudentProfile')({
@@ -101,8 +97,8 @@ export function AuthProvider({ children }) {
       })
       return fetchProfile(user.uid)
     } catch (err) {
-      // Cloud Function failed — clean up the orphaned auth account so the user
-      // can try again cleanly rather than getting "Account not set up" forever.
+      // Cloud Function failed — delete the orphaned auth account so the user
+      // can sign up again cleanly instead of getting "Account not set up" forever.
       console.error('createStudentProfile failed, deleting auth user:', err)
       try { await user.delete() } catch (deleteErr) {
         console.error('Could not delete orphaned auth user:', deleteErr)
@@ -113,8 +109,6 @@ export function AuthProvider({ children }) {
 
   const signupStudentWithGoogle = async ({ firstName, middleName, surname, year, branch, roll }) => {
     const { user } = await signInWithPopup(auth, new GoogleAuthProvider())
-
-    // Ensure ID token exists before calling the function
     await user.getIdToken(true)
 
     try {
